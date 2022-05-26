@@ -1,11 +1,16 @@
-use gst::prelude::*;
-use gst_webrtc::{WebRTCSessionDescription, WebRTCSDPType};
+use gst::{prelude::*, glib::ffi::GError};
 use gst_sdp::sdp_message::SDPMessage;
+use gst_webrtc::{WebRTCSDPType, WebRTCSessionDescription};
 
 mod services;
 use services::*;
 
-fn prepare_pipeline() -> Result<Box<gst::Pipeline>, gst::glib::Error> {
+use clap::Parser;
+
+fn prepare_pipeline(
+    video_base: String,
+    audio_base: String,
+) -> Result<Box<gst::Pipeline>, gst::glib::Error> {
     // Initialize gstreamer
     if let Err(e) = gst::init() {
         eprintln!("Could not initialize gstreamer");
@@ -13,7 +18,10 @@ fn prepare_pipeline() -> Result<Box<gst::Pipeline>, gst::glib::Error> {
     }
 
     // Build the pipeline
-    let pipeline = match gst::parse_launch(&format!("queue name=videoqueue ! rtph264depay ! decodebin ! queue ! autovideosink sync=false")) {
+    let pipeline = match gst::parse_launch(&format!(
+        "queue name=videoqueue ! {} queue name=audioqueue ! {}",
+        video_base, audio_base
+    )) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to parse initial pipeline");
@@ -24,38 +32,58 @@ fn prepare_pipeline() -> Result<Box<gst::Pipeline>, gst::glib::Error> {
     Ok(Box::new(pipeline.dynamic_cast::<gst::Pipeline>().unwrap()))
 }
 
-fn add_webrtc(services: &Box<Services>, identifier: &String,  pipeline: &Box::<gst::Pipeline>) {
+fn add_webrtc(services: &Box<Services>, identifier: &String, pipeline: &Box<gst::Pipeline>) {
     println!("Adding Webrtc node");
 
-    if let Some(_webrtc) = pipeline.by_name(format!("webrtc-{}", identifier).as_str()) {
+    if let Some(_webrtc) = pipeline.by_name(String::from("webrtc").as_str()) {
         let identifier = identifier.clone();
         remove_webrtc(identifier, pipeline);
-    } else {
-        let queue = pipeline.by_name("videoqueue").unwrap();
-        let webrtc = gst::ElementFactory::make("webrtcbin", Some(format!("webrtc-{}", identifier).as_str())).expect("");
-        webrtc.set_property("latency", 0 as u32);
+    }
 
-        pipeline.add(&webrtc).unwrap();
-        {
-            let services = services.clone();
-            let identifier = identifier.clone();
-            webrtc.connect("on-ice-candidate", false, move |values| {
-                println!("ICE Candidate created");
-                let sdp_mline_index = values[1].get::<u32>().expect("Invalid argument");
-                let candidate = values[2].get::<String>().expect("Invalid argument");
+    let webrtc =
+        gst::ElementFactory::make("webrtcbin", Some(String::from("webrtc").as_str()))
+            .expect("");
+    webrtc.set_property("latency", 0 as u32);
 
-                services.send_ice_candidate(&identifier, sdp_mline_index, candidate);
-                println!("ICE Candidate sent");
-                None
-            });
-            webrtc.connect("pad-added", false, move |srcpad| {
-                println!("Pad added");
-                let sinkpad = queue.static_pad("sink").unwrap();
-                let srcpad = srcpad[1].get::<gst::Pad>().expect("Invalid argument");
-                srcpad.link(&sinkpad).unwrap();
-                None
-            });
-        }
+    pipeline.add(&webrtc).unwrap();
+    {
+        let services = services.clone();
+        let identifier = identifier.clone();
+        webrtc.connect("on-ice-candidate", false, move |values| {
+            println!("ICE Candidate created");
+            let sdp_mline_index = values[1].get::<u32>().expect("Invalid argument");
+            let candidate = values[2].get::<String>().expect("Invalid argument");
+
+            services.send_ice_candidate(&identifier, sdp_mline_index, candidate);
+            println!("ICE Candidate sent");
+            None
+        });
+        let pipeline = pipeline.clone();
+        webrtc.connect("pad-added", false, move |srcpad| {
+            println!("Pad added: ");
+            let srcpad = srcpad[1].get::<gst::Pad>().expect("Invalid argument");
+            let current_caps = srcpad.current_caps().unwrap();
+            let media_type: String = current_caps.structure(0).unwrap().get("media").unwrap();
+            let encoding: String = current_caps
+                .structure(0)
+                .unwrap()
+                .get("encoding-name")
+                .unwrap();
+            println!("Encoding: {}", encoding);
+            let sinkpad = match media_type.as_str() {
+                "video" => {
+                    let video_queue = pipeline.by_name("videoqueue").unwrap();
+                    video_queue.static_pad("sink").unwrap()
+                },
+                "audio" => {
+                    let audio_queue = pipeline.by_name("audioqueue").unwrap();
+                    audio_queue.static_pad("sink").unwrap()
+                },
+                _ => panic!("Wrong media type received !"),
+            };
+            srcpad.link(&sinkpad).unwrap();
+            None
+        });
     }
 
     // Start playing
@@ -64,15 +92,30 @@ fn add_webrtc(services: &Box<Services>, identifier: &String,  pipeline: &Box::<g
         .expect("Unable to set the pipeline to the `Playing` state");
 }
 
-fn remove_webrtc(identifier: String, pipeline: &Box::<gst::Pipeline>) {
+fn remove_webrtc(identifier: String, pipeline: &Box<gst::Pipeline>) {
     println!("Removing Webrtc node");
-    let webrtc = pipeline.by_name(format!("webrtc-{}",identifier).as_str()).unwrap();
+
+    // Pause
+    pipeline
+        .set_state(gst::State::Paused)
+        .expect("Unable to set the pipeline to the `Playing` state");
+
+    let webrtc = pipeline
+        .by_name(String::from("webrtc").as_str())
+        .unwrap();
     pipeline.remove_many(&[&webrtc]).unwrap();
 }
 
-fn handle_sdp_offer(services: &Box<Services>, identifier: &String, offer: gst_webrtc::WebRTCSessionDescription, pipeline: &Box<gst::Pipeline>) {
+fn handle_sdp_offer(
+    services: &Box<Services>,
+    identifier: &String,
+    offer: gst_webrtc::WebRTCSessionDescription,
+    pipeline: &Box<gst::Pipeline>,
+) {
     println!("Setting remote description");
-    let webrtc = pipeline.by_name(format!("webrtc-{}", identifier).as_str()).unwrap();
+    let webrtc = pipeline
+        .by_name(String::from("webrtc").as_str())
+        .unwrap();
     let services = services.clone();
     let ident = identifier.clone();
     let w = webrtc.clone();
@@ -80,6 +123,7 @@ fn handle_sdp_offer(services: &Box<Services>, identifier: &String, offer: gst_we
         println!("Remote description set");
         let w2 = w.clone();
         let promise = gst::Promise::with_change_func(move |reply| {
+            println!("SDP Answer created");
             let reply = match reply {
                 Ok(Some(reply)) => reply,
                 Ok(None) => {
@@ -91,16 +135,30 @@ fn handle_sdp_offer(services: &Box<Services>, identifier: &String, offer: gst_we
                     return;
                 }
             };
+            println!("{:?}", reply);
+            
+            match reply.value("error").map(|error| {
+                error
+            }) {
+                Ok(o) => {
+                    //println!("SDP generated Error: {:?}", o.get::<gst::message::Error>().unwrap());
+                },
+                Err(err) => {
+                    eprintln!("SDP error getting error: {:?}", err);
+                }
+            };
             let answer = match reply.value("answer").map(|answer| {
-                println!("Offer created");
                 answer
             }) {
                 Ok(o) => o,
-                Err(_) => {
+                Err(err) => {
+                    eprintln!("SDP answer generation error: {:?}", err);
                     return;
                 }
             };
-            let desc = answer.get::<gst_webrtc::WebRTCSessionDescription>().unwrap();
+            let desc = answer
+                .get::<gst_webrtc::WebRTCSessionDescription>()
+                .unwrap();
             println!("SDP Type: {}", desc.type_().to_str());
             println!("SDP :\n{}", desc.sdp().as_text().unwrap());
 
@@ -119,14 +177,54 @@ fn handle_sdp_offer(services: &Box<Services>, identifier: &String, offer: gst_we
     webrtc.emit_by_name::<()>("set-remote-description", &[&offer, &promise]);
 }
 
-fn handle_ice_candidate(identifier: &String, sdp_mline_index: u32, candidate: &str, pipeline: &Box<gst::Pipeline>) {
-    let webrtc = pipeline.by_name(format!("webrtc-{}", identifier).as_str()).unwrap();
+fn handle_ice_candidate(
+    identifier: &String,
+    sdp_mline_index: u32,
+    candidate: &str,
+    pipeline: &Box<gst::Pipeline>,
+) {
+    let webrtc = pipeline
+        .by_name(String::from("webrtc").as_str())
+        .unwrap();
     webrtc.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
+}
+
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Signaling server address
+    #[clap(long, default_value = "localhost")]
+    address: String,
+
+    /// Signaling server port
+    #[clap(long, default_value = "8000")]
+    port: u32,
+
+    /// Use SSL/TLS to contact Signaling server
+    #[clap(long)]
+    unsecure: bool,
+
+    /// Gstreamer video pipeline base
+    #[clap(
+        long,
+        default_value = "rtph264depay ! decodebin ! queue ! autovideosink sync=false"
+    )]
+    video_base: String,
+
+    /// Gstreamer audio pipeline base
+    #[clap(
+        long,
+        default_value = "rtpopusdepay ! decodebin ! queue ! autoaudiosink sync=false"
+    )]
+    audio_base: String,
 }
 
 #[tokio::main]
 async fn main() {
-    let pipeline = match prepare_pipeline() {
+    let args = Args::parse();
+
+    let pipeline = match prepare_pipeline(args.video_base, args.audio_base) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to initialize pipeline:\n{:?}", e);
@@ -134,32 +232,53 @@ async fn main() {
         }
     };
 
-    let services = Box::new(Services::new("http://localhost:8900/".to_string()));
+    let signaling_protocol = if args.unsecure { "http" } else { "https" };
+    let uri = format!("{}://{}:{}/", signaling_protocol, args.address, args.port);
+
+    println!("Connecting to signaling server with uri: {}", uri);
+    let services = Box::new(Services::new(uri));
     {
         let pipeline = &pipeline.clone();
         let services = &services.clone();
-        services.start_sse(move |message: &IncomingMessage| {
-            println!("New incoming SDP message:");
-            add_webrtc(services, &message.sender, pipeline);
-            if let Payload::SDP { description } = &message.payload {
-                println!("{:?}", description);
-                let sdp = match SDPMessage::parse_buffer(description.as_bytes()) {
-                    Ok(r) => r,
-                    Err(err) => { 
-                        println!("Error: Can't parse SDP Description !");
-                        println!("{:?}", err);
-                        return;
+        services
+            .start_sse(
+                move |sender| {
+                    add_webrtc(&services, sender, &pipeline);
+                },
+                move |message: &IncomingMessage| {
+                    println!("New incoming SDP message:");
+                    if let Payload::SDP { description } = &message.payload {
+                        println!("{:?}", description);
+                        let sdp = match SDPMessage::parse_buffer(description.as_bytes()) {
+                            Ok(r) => r,
+                            Err(err) => {
+                                println!("Error: Can't parse SDP Description !");
+                                println!("{:?}", err);
+                                return;
+                            }
+                        };
+                        handle_sdp_offer(
+                            &services,
+                            &message.sender,
+                            WebRTCSessionDescription::new(WebRTCSDPType::Offer, sdp),
+                            &pipeline,
+                        );
                     }
-                };
-                handle_sdp_offer(&services, &message.sender, WebRTCSessionDescription::new(WebRTCSDPType::Offer, sdp), &pipeline);
-            }
-        }, move |message: &IncomingMessage| {
-            println!("New incoming ICE candidate:");
-            if let Payload::ICE { index, candidate } = &message.payload {
-                println!("{:?}", candidate);
-                handle_ice_candidate(&message.sender, *index, candidate.as_str(), &pipeline);
-            };
-        }).await;
+                },
+                move |message: &IncomingMessage| {
+                    println!("New incoming ICE candidate:");
+                    if let Payload::ICE { index, candidate } = &message.payload {
+                        println!("{:?}", candidate);
+                        handle_ice_candidate(
+                            &message.sender,
+                            *index,
+                            candidate.as_str(),
+                            &pipeline,
+                        );
+                    };
+                },
+            )
+            .await;
     }
 
     // Shutdown pipeline

@@ -99,9 +99,10 @@ impl Services {
         });
     }
 
-    pub async fn start_sse<F1, F2>(&self, on_sdp_offer: F1, on_ice_candidate: F2) where
-        F1: Fn(&IncomingMessage),
+    pub async fn start_sse<F1, F2, F3>(&self, on_call: F1, on_sdp_offer: F2, on_ice_candidate: F3) where
+        F1: Fn(&String),
         F2: Fn(&IncomingMessage),
+        F3: Fn(&IncomingMessage)
     {
         let mut stream = self.client
             .get(format!("{}/events", self.base_url))
@@ -122,10 +123,12 @@ impl Services {
                         Payload::NewCamera => {
                             println!("New camera available");
                             self.send_call(&message.sender);
+                            on_call(&message.sender);
                         }
                         Payload::CameraPing => {
                             println!("Camera ping");
                             self.send_call(&message.sender);
+                            on_call(&message.sender);
                         }
                         Payload::SDP {..} => {
                             on_sdp_offer(&message);
